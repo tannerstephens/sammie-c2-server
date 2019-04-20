@@ -23,11 +23,12 @@ def new_client(client_socket, addr):
   global clients
   
   data = read_until_eod(client_socket)
+
   if data.startswith("reconnect"):
     cid = data.split(" ")[1].strip()
+    print(cid)
     with lock:
-      possible = filter(lambda k: clients[k]["cid"] == cid, clients)
-      raise Exception(str(possible))
+      possible = list(filter(lambda k: k["cid"] == cid, clients))
     
       if possible:
         possible[0]["socket"].close()
@@ -176,6 +177,7 @@ def main():
 
 
   try:
+    #input("")
     curses.wrapper(nice_menu_function)
   except KeyboardInterrupt:
     pass
