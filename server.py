@@ -23,6 +23,21 @@ def new_client(client_socket, addr):
   global clients
   
   data = read_until_eod(client_socket)
+  if data.startswith("reconnect"):
+    cid = data.split(" ")[1].strip()
+    with lock:
+      possible = filter(lambda k: clients[k]["cid"] == cid, clients)
+      raise Exception(str(possible))
+    
+      if possible:
+        possible[0]["socket"].close()
+        possible[0]["socket"] = client_socket
+      else:
+        client_socket.close()
+    return
+    
+
+
 
   with lock:
     cid = str(uuid.uuid4())
@@ -71,13 +86,13 @@ def client_menu(stdscr, c_num):
           clients.remove(client)
         c_menu = False
       elif selected == 2: # Execute Command
-        pass
+        execute_menu(stdscr, client)
       elif selected == 3: # Download File
-        pass
+        download_menu(stdscr, client)
       elif selected == 4: # Upload File
-        pass
+        upload_menu(stdscr, client)
       elif selected == 5: # Open Shell
-        pass
+        shell_menu(stdscr, client)
     elif c == curses.KEY_DOWN:
       selected = (selected + 1)%6
     elif c == curses.KEY_UP:
