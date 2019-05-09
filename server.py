@@ -317,6 +317,9 @@ def curses_shell(stdscr, client):
       input_value = input_value[:-1]
     if k == curses.KEY_ENTER or k == 10 or "\n" in input_value:
       client.shell_send(input_value.split("\n")[0] + "\n")
+      if input_value.split('\n')[0] == "exit":
+        client.shell_thread.running = False
+        return
       input_value = ""
 
     new_output = client.shell_read()
